@@ -1,0 +1,278 @@
+name: Deploy to Azure Web App
+
+on:
+  workflow_dispatch:
+  # Push trigger comentado para evitar deploy automático no primeiro commit
+  # Descomente as linhas abaixo se quiser deploy automático em futuros pushes:
+  # push:
+  #   branches:
+  #     - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js version
+        uses: actions/setup-node@v3
+        with:
+          node-version: '22.x'
+
+      - name: Detect project structure and build
+        run: |
+          # Check if it's a monorepo with frontend/backend
+          if [ -d "frontend" ] && [ -d "backend" ]; then
+            echo "Detected frontend/backend structure"
+            
+            # Build frontend
+            if [ -f "frontend/package.json" ]; then
+              echo "Building frontend..."
+              cd frontend
+              npm install
+              npm run build --if-present
+              cd ..
+            fi
+            
+            # Build backend
+            if [ -f "backend/package.json" ]; then
+              echo "Building backend..."
+              cd backend
+              
+              # Install ALL dependencies (including devDependencies for build)
+              echo "Installing all dependencies including devDependencies..."
+              npm install --production=false
+              
+              # Build TypeScript if tsconfig exists
+              if [ -f "tsconfig.json" ]; then
+                echo "TypeScript project detected, building..."
+                npm run build
+                
+                # Verify dist folder was created
+                if [ -d "dist" ]; then
+                  echo "✓ Build successful - dist folder created"
+                  ls -la dist/
+                else
+                  echo "✗ Build failed - no dist folder found"
+                  exit 1
+                fi
+              fi
+              
+              # Now install only production dependencies for deployment
+              echo "Installing production dependencies only..."
+              rm -rf node_modules
+              npm install --production
+              
+              cd ..
+            fi
+            
+            # Copy frontend build to backend public folder
+            if [ -d "frontend/dist" ] || [ -d "frontend/build" ]; then
+              echo "Copying frontend build to backend..."
+              mkdir -p backend/public
+              
+              if [ -d "frontend/dist" ]; then
+                cp -r frontend/dist/* backend/public/
+                echo "✓ Frontend dist copied to backend/public"
+              elif [ -d "frontend/build" ]; then
+                cp -r frontend/build/* backend/public/
+                echo "✓ Frontend build copied to backend/public"
+              fi
+              
+              # Verify frontend was copied
+              if [ -f "backend/public/index.html" ]; then
+                echo "✓ Frontend index.html found in backend/public"
+              else
+                echo "⚠ Warning: No index.html found in backend/public"
+              fi
+            fi
+            
+            # Create Azure configuration files in backend folder
+            echo "Creating Azure configuration files..."
+            cd backend
+            node -e "
+              const fs = require('fs');
+              const path = require('path');
+              
+              // Detect if TypeScript or JavaScript project (we're now IN backend folder)
+              const hasTsConfig = fs.existsSync('tsconfig.json');
+              const entryPoint = hasTsConfig ? 'dist/server.js' : 'server.js';
+              
+              // Create web.config for Azure Windows App Service
+              const webConfig = '<?xml version="1.0" encoding="utf-8"?>\n' +
+                '<configuration>\n' +
+                '  <system.webServer>\n' +
+                '    <webSocket enabled="false" />\n' +
+                '    <handlers>\n' +
+                '      <add name="iisnode" path="' + entryPoint + '" verb="*" modules="iisnode"/>\n' +
+                '    </handlers>\n' +
+                '    <rewrite>\n' +
+                '      <rules>\n' +
+                '        <rule name="NodeInspector" patternSyntax="ECMAScript" stopProcessing="true">\n' +
+                '          <match url="^' + entryPoint.replace('/', '\\/') + '\\/debug[\\/]?" />\n' +
+                '        </rule>\n' +
+                '        <rule name="StaticContent">\n' +
+                '          <action type="Rewrite" url="public{REQUEST_URI}"/>\n' +
+                '        </rule>\n' +
+                '        <rule name="DynamicContent">\n' +
+                '          <conditions>\n' +
+                '            <add input="{REQUEST_FILENAME}" matchType="IsFile" negate="True"/>\n' +
+                '          </conditions>\n' +
+                '          <action type="Rewrite" url="' + entryPoint + '"/>\n' +
+                '        </rule>\n' +
+                '      </rules>\n' +
+                '    </rewrite>\n' +
+                '    <security>\n' +
+                '      <requestFiltering>\n' +
+                '        <hiddenSegments>\n' +
+                '          <remove segment="bin"/>\n' +
+                '        </hiddenSegments>\n' +
+                '      </requestFiltering>\n' +
+                '    </security>\n' +
+                '    <httpErrors existingResponse="PassThrough" />\n' +
+                '    <iisnode node_env="production" />\n' +
+                '  </system.webServer>\n' +
+                '</configuration>';
+              
+              fs.writeFileSync('web.config', webConfig);
+              console.log('web.config created');
+              
+              // Create .deployment file
+              const deploymentConfig = '[config]\n' +
+                'SCM_DO_BUILD_DURING_DEPLOYMENT=false\n';
+              fs.writeFileSync('.deployment', deploymentConfig);
+              console.log('.deployment file created');
+              
+              // Create iisnode.yml
+              const iisnodeConfig = 'node_env: production\n' +
+                'loggingEnabled: true\n' +
+                'logDirectory: iisnode\n' +
+                'devErrorsEnabled: false\n' +
+                'debuggingEnabled: false\n' +
+                'maxLogFileSizeInKB: 128\n' +
+                'maxTotalLogFileSizeInKB: 1024\n' +
+                'maxLogFiles: 20\n';
+              fs.writeFileSync('iisnode.yml', iisnodeConfig);
+              console.log('iisnode.yml created');
+              
+              // Ensure package.json has correct start script (we're in backend folder)
+              const pkgPath = 'package.json';
+              if (fs.existsSync(pkgPath)) {
+                const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+                pkg.scripts = pkg.scripts || {};
+                
+                // Set correct start script based on project type
+                if (hasTsConfig) {
+                  pkg.scripts.start = 'node dist/server.js';
+                  if (!pkg.scripts.build) {
+                    pkg.scripts.build = 'tsc';
+                  }
+                  console.log('TypeScript project: start script set to dist/server.js');
+                } else {
+                  pkg.scripts.start = 'node server.js';
+                  console.log('JavaScript project: start script set to server.js');
+                }
+                
+                fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2));
+                console.log('Updated package.json scripts');
+              }
+            "
+            cd ..
+            # Backend is ready with all configs
+          elif [ -f "package.json" ]; then
+            # Single project structure
+            echo "Detected single project structure"
+            npm install
+            npm run build --if-present
+            npm run test --if-present -- --passWithNoTests
+          else
+            echo "No package.json found in expected locations"
+            exit 1
+          fi
+
+      - name: Zip artifact for deployment
+        run: |
+          # Check current location and create package
+          if [ -d "backend" ]; then
+            echo "Creating deployment package from backend folder"
+            cd backend
+            
+            # List contents before zipping
+            echo "Contents of backend folder:"
+            ls -la
+            
+            # Check critical files exist
+            if [ ! -d "dist" ]; then
+              echo "✗ ERROR: dist folder not found!"
+              exit 1
+            fi
+            
+            if [ ! -f "package.json" ]; then
+              echo "✗ ERROR: package.json not found!"
+              exit 1
+            fi
+            
+            if [ ! -f "web.config" ]; then
+              echo "✗ ERROR: web.config not found!"
+              exit 1
+            fi
+            
+            echo "Contents of dist folder:"
+            ls -la dist/
+            
+            # Create zip with everything needed
+            zip -r ../release.zip . -x "node_modules/*" ".git/*" "src/*" "*.ts" "tsconfig.json"
+            cd ..
+            
+            echo "Package created successfully"
+          else
+            echo "Creating deployment package from root"
+            zip -r release.zip . -x "node_modules/*" ".git/*"
+          fi
+          
+          # Verify and show package info
+          echo "Package info:"
+          ls -lh release.zip
+          echo "Package contents:"
+          unzip -l release.zip | head -20
+
+      - name: Upload artifact for deployment job
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-app
+          path: release.zip
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    environment:
+      name: 'Production'
+      url: ${{ steps.deploy-to-webapp.outputs.webapp-url }}
+    
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Download artifact from build job
+        uses: actions/download-artifact@v4
+        with:
+          name: node-app
+
+      - name: Unzip artifact for deployment
+        run: unzip release.zip
+      
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: 'Deploy to Azure Web App'
+        id: deploy-to-webapp
+        uses: azure/webapps-deploy@v2
+        with:
+          app-name: 'expandev-06'
+          package: .
